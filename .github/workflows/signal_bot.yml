@@ -1,0 +1,195 @@
+# ==============================================================================
+# APEX-QUANT-OMNI SOVEREIGN v75.1 — GitHub Actions Workflow
+# ==============================================================================
+# Cadence     : Every 15 minutes (aligned to 15m execution timeframe)
+# Modes       : once (full cycle + listener) | check (analysis only) | listen
+# Secrets     : TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DISCORD_WEBHOOK_URL
+# Artifacts   : trading_signals.db, backtest_performance.png
+# Persistence : actions/cache@v4 restores the SQLite DB from previous run
+# ==============================================================================
+
+name: APEX-QUANT-OMNI SOVEREIGN v75.1
+
+on:
+  schedule:
+    # Every 15 minutes — 96 runs/day. Aligned to 15m bar close cadence.
+    - cron: "*/15 * * * *"
+
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Execution mode (once = full cycle + listener, check = analysis only, listen = commands only)"
+        required: false
+        default: "once"
+        type: choice
+        options:
+          - once
+          - check
+          - listen
+      listen_seconds:
+        description: "Interactive Telegram 2-way command listener budget (seconds)"
+        required: false
+        default: "240"
+
+# Prevent overlapping runs so the SQLite cache never races.
+concurrency:
+  group: apex-quant-omni-sovereign
+  cancel-in-progress: false
+
+# Minimal token permissions (least privilege).
+permissions:
+  contents: read
+
+jobs:
+  apex-quant-omni:
+    name: XAUUSD Hybrid Quantitative Signal Engine (v75.1)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    # ------------------------------------------------------------------------
+    # Environment
+    # ------------------------------------------------------------------------
+    # NOTE: If DISCORD_WEBHOOK_URL is intentionally left unset, the bot
+    #       gracefully skips Discord delivery (send_discord returns False).
+    #       Telegram is the primary channel; Discord is optional redundancy.
+    # ------------------------------------------------------------------------
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+      ACCOUNT_BALANCE: "10000"
+      RISK_PERCENT:    "1.0"
+      CONTRACT_SIZE:   "100"
+      DB_PATH:         "trading_signals.db"
+      CHART_PATH:      "backtest_performance.png"
+      POLL_SECONDS:    "240"
+      PYTHONUNBUFFERED: "1"
+      MPLBACKEND:      "Agg"
+
+    steps:
+      # ----------------------------------------------------------------------
+      # 1. Checkout
+      # ----------------------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ----------------------------------------------------------------------
+      # 2. Python + pip cache
+      # ----------------------------------------------------------------------
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip wheel setuptools
+          pip install -r requirements.txt
+
+      # ----------------------------------------------------------------------
+      # 3. Restore SQLite artifact from previous run
+      # ----------------------------------------------------------------------
+      # Pattern: cache key rotates each run (run_id) while restore-keys falls
+      # back to the most recent matching cache. This preserves the DB
+      # (signals, audit log, trailing state) across cron invocations.
+      # ----------------------------------------------------------------------
+      - name: Restore SQLite artifact from previous run
+        uses: actions/cache@v4
+        with:
+          path: trading_signals.db
+          key: apex-quant-db-${{ github.run_id }}
+          restore-keys: |
+            apex-quant-db-
+
+      # ----------------------------------------------------------------------
+      # 4. Execute sovereign engine
+      # ----------------------------------------------------------------------
+      # `set -e` is implicit in GitHub Actions. Empty workflow_dispatch inputs
+      # (e.g. cron triggers) are replaced with safe defaults.
+      # ----------------------------------------------------------------------
+      - name: Execute sovereign engine
+        run: |
+          MODE="${{ github.event.inputs.mode }}"
+          if [ -z "$MODE" ]; then MODE="once"; fi
+          LISTEN="${{ github.event.inputs.listen_seconds }}"
+          if [ -z "$LISTEN" ]; then LISTEN="240"; fi
+          echo "Launching engine :: mode=$MODE listen=$LISTEN"
+          python bot.py --mode "$MODE" --listen-seconds "$LISTEN"
+
+      # ----------------------------------------------------------------------
+      # 5. Forensic DB inspection (always runs, never fails the job)
+      # ----------------------------------------------------------------------
+      # Prints row counts per table so the run log itself becomes a forensic
+      # artifact even before the .db file is uploaded.
+      # ----------------------------------------------------------------------
+      - name: Forensic DB inspection
+        if: always()
+        run: |
+          if [ -f trading_signals.db ]; then
+            python <<'PYEOF'
+import sqlite3
+conn = sqlite3.connect('trading_signals.db')
+conn.row_factory = sqlite3.Row
+print('--- FORENSIC DB INSPECTION ---')
+for table in ('signals', 'audit', 'open_positions', 'optimization_runs'):
+    try:
+        count = conn.execute(f'SELECT COUNT(*) FROM {table}').fetchone()[0]
+        print(f'  {table:<20} : {count} rows')
+    except Exception as exc:
+        print(f'  {table:<20} : ERROR - {exc}')
+row = conn.execute(
+    "SELECT ts, decision, entry, confluence FROM signals ORDER BY id DESC LIMIT 1"
+).fetchone()
+if row:
+    print(f'  latest signal       : {row["ts"]} | {row["decision"]} '
+          f'@ {row["entry"]} (conf {row["confluence"]:.1f})')
+PYEOF
+          else
+            echo "trading_signals.db not present — first run or fatal crash"
+          fi
+
+      # ----------------------------------------------------------------------
+      # 6. Upload forensic artifacts
+      # ----------------------------------------------------------------------
+      # `if: always()` ensures artifacts are uploaded even if the engine step
+      # fails — preserving the audit trail for post-mortem analysis.
+      # ----------------------------------------------------------------------
+      - name: Upload forensic artifacts (SQLite DB + backtest chart)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apex-quant-omni-artifacts-${{ github.run_number }}
+          path: |
+            trading_signals.db
+            backtest_performance.png
+          if-no-files-found: warn
+          retention-days: 30
+          compression-level: 6
+
+      # ----------------------------------------------------------------------
+      # 7. Run summary (visible on the Actions UI page)
+      # ----------------------------------------------------------------------
+      - name: Emit run summary
+        if: always()
+        run: |
+          {
+            echo "### APEX-QUANT-OMNI SOVEREIGN v75.1"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| **Run Number** | ${{ github.run_number }} |"
+            echo "| **Mode** | ${{ github.event.inputs.mode || 'once' }} |"
+            echo "| **Trigger** | ${{ github.event_name }} |"
+            echo "| **Timestamp (UTC)** | $(date -u +'%Y-%m-%dT%H:%M:%SZ') |"
+            if [ -f trading_signals.db ]; then
+              echo "| **SQLite DB** | present ($(du -h trading_signals.db | cut -f1)) |"
+            else
+              echo "| **SQLite DB** | MISSING |"
+            fi
+            if [ -f backtest_performance.png ]; then
+              echo "| **Backtest Chart** | present ($(du -h backtest_performance.png | cut -f1)) |"
+            else
+              echo "| **Backtest Chart** | MISSING |"
+            fi
+          } >> $GITHUB_STEP_SUMMARY
