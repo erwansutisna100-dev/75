@@ -1,24 +1,9 @@
 # ==============================================================================
-# APEX-QUANT-OMNI SOVEREIGN v75.1 — Python Dependency Manifest
-# Python 3.11 (GitHub Actions ubuntu-latest default)
+# APEX-QUANT-OMNI SOVEREIGN v75.2 — Python Dependency Manifest
 # ==============================================================================
-
-# Core numerical / data stack
-#   pandas>=2.2 provides the stable MultiIndex flattening + unique-column ops
-#   used by _finalize_ohlcv (FIX-1). numpy<2.3 keeps downstream math consistent.
 pandas>=2.2.0,<3.0.0
 numpy>=1.26.0,<2.3.0
-
-# HTTP + webhook delivery
 requests>=2.31.0,<3.0.0
-
-# Market data — 0.2.50+ pins the auto_adjust=True semantics we depend on
-# (removes 'Adj Close' at the source; belt-and-suspenders with FIX-1).
 yfinance>=0.2.50,<0.3.0
-
-# Headless chart rendering (Agg backend enforced in bot.py at line 1)
 matplotlib>=3.8.0,<4.0.0
-
-# Timezone database — ensures UTC conversion works on minimal Ubuntu images
-# even when system tzdata is stripped (rare but observed on some runners).
 tzdata>=2024.1
