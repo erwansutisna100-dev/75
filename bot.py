@@ -39,6 +39,7 @@ import requests
 import yfinance as yf
 
 warnings.filterwarnings("ignore")
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 
 # ==============================================================================
 # 1. CONFIGURATION & CONSTANTS
@@ -670,7 +671,6 @@ def _finalize_ohlcv(df: Optional[pd.DataFrame], min_rows: int = 80) -> Optional[
         return None
     df = df.copy()
 
-    # Flatten MultiIndex safely from yfinance
     if isinstance(df.columns, pd.MultiIndex):
         lvl0 = [str(c).strip().lower() for c in df.columns.get_level_values(0)]
         lvl1 = [str(c).strip().lower() for c in df.columns.get_level_values(1)]
@@ -710,7 +710,6 @@ def _finalize_ohlcv(df: Optional[pd.DataFrame], min_rows: int = 80) -> Optional[
     if df.empty:
         return None
 
-    # Positive price sanity guard for Spot Gold
     df = df[(df["open"] > 100.0) & (df["high"] > 100.0) & (df["low"] > 100.0) & (df["close"] > 100.0)]
     if df.empty:
         return None
@@ -726,8 +725,6 @@ def _finalize_ohlcv(df: Optional[pd.DataFrame], min_rows: int = 80) -> Optional[
         df.index = df.index.tz_convert("UTC")
 
     df = df[~df.index.duplicated(keep="last")].sort_index()
-
-    # Enforce OHLC geometric consistency vectorized
     df["high"] = np.maximum(df["high"], np.maximum(df["open"], df["close"]))
     df["low"] = np.minimum(df["low"], np.minimum(df["open"], df["close"]))
     df = df[df["high"] >= df["low"]]
@@ -818,22 +815,107 @@ def source_stooq_spot(symbol: str = "xauusd", interval: str = "d", min_rows: int
     return _finalize_ohlcv(raw, min_rows=min_rows)
 
 
-# Strictly prioritize Spot Gold (XAUUSD=X) and spot-pegged proxies; NO GC=F futures.
+def source_kraken_ohlc(pair: str = "PAXGUSD", interval: int = 5, min_rows: int = 80) -> Optional[pd.DataFrame]:
+    url = f"https://api.kraken.com/0/public/OHLC?pair={quote(pair, safe='')}&interval={interval}"
+    resp = requests.get(url, headers=UA_HEADERS, timeout=HTTP_TIMEOUT)
+    resp.raise_for_status()
+    payload = resp.json()
+    if payload.get("error"):
+        raise RuntimeError(f"kraken error: {payload['error']}")
+    result = payload.get("result") or {}
+    key = next((k for k in result.keys() if k != "last"), None)
+    if not key:
+        raise RuntimeError("kraken empty result")
+    rows = result[key]
+    frame = pd.DataFrame(
+        rows,
+        columns=["time", "open", "high", "low", "close", "vwap", "volume", "count"],
+    )
+    frame["dt"] = pd.to_datetime(pd.to_numeric(frame["time"], errors="coerce"), unit="s", utc=True)
+    frame = frame.dropna(subset=["dt"]).set_index("dt")
+    return _finalize_ohlcv(frame[["open", "high", "low", "close", "volume"]], min_rows=min_rows)
+
+
+def fetch_live_spot_xauusd() -> Optional[Tuple[float, float, str]]:
+    """Fetch live Spot XAU/USD mid price and spread from public institutional feeds."""
+    try:
+        resp = requests.get(
+            "https://forex-data-feed.swissquote.com/public-quotes/bboquotes/instrument/XAU/USD",
+            headers=UA_HEADERS,
+            timeout=8,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if isinstance(data, list) and data:
+            profiles = data[0].get("spreadProfilePrices") or []
+            if profiles:
+                q = profiles[0]
+                bid = safe_float(q.get("bid"), 0.0)
+                ask = safe_float(q.get("ask"), 0.0)
+                if bid > 100.0 and ask >= bid:
+                    return round((bid + ask) * 0.5, 2), round(ask - bid, 3), "swissquote-XAUUSD"
+    except Exception:
+        pass
+
+    try:
+        resp = requests.get(
+            "https://data-asg.goldprice.org/dbXRates/USD",
+            headers=UA_HEADERS,
+            timeout=8,
+        )
+        resp.raise_for_status()
+        items = resp.json().get("items") or []
+        if items:
+            px = safe_float(items[0].get("xauPrice"), 0.0)
+            if px > 100.0:
+                return round(px, 2), 0.30, "goldprice-XAUUSD"
+    except Exception:
+        pass
+    return None
+
+
+def _align_to_spot_basis(df: pd.DataFrame, source_name: str) -> Tuple[pd.DataFrame, str, Optional[float]]:
+    if "stooq-XAUUSD" in source_name or not session_governor("SWING")[0]:
+        return df, source_name, None
+    spot_info = fetch_live_spot_xauusd()
+    if spot_info is None:
+        return df, source_name, None
+    spot_px, live_spread, spot_src = spot_info
+    last_close = safe_float(df["close"].iloc[-1], 0.0)
+    if last_close <= 100.0:
+        return df, source_name, live_spread
+    basis = spot_px - last_close
+    if abs(basis) / last_close <= 0.02:
+        aligned = df.copy()
+        for col in ("open", "high", "low", "close"):
+            aligned[col] = aligned[col] + basis
+        log.info(
+            "Spot Basis Calibrated: %s -> %s (spot=%.2f, basis=%+.2f, spread=%.2f)",
+            source_name,
+            spot_src,
+            spot_px,
+            basis,
+            live_spread,
+        )
+        return aligned, f"{source_name}+{spot_src}", live_spread
+    return df, source_name, live_spread
+
+
+# Multi-source Spot Gold failover (Kraken Spot + Yahoo PAXG-USD / XAUT-USD + Stooq Spot; NO GC=F futures)
 SCALP_SOURCES: Tuple[Tuple[str, Callable[[], Optional[pd.DataFrame]], bool], ...] = (
-    ("yfinance-XAUUSD=X-5m", lambda: source_yfinance("XAUUSD=X", "5m", "5d", 100), False),
-    ("yahoo-chart-XAUUSD=X-5m", lambda: source_yahoo_chart_api("XAUUSD=X", "5m", "5d", 100), False),
-    ("yfinance-XAUUSD=X-15m", lambda: source_yfinance("XAUUSD=X", "15m", "1mo", 100), False),
-    ("yahoo-chart-XAUUSD=X-15m", lambda: source_yahoo_chart_api("XAUUSD=X", "15m", "1mo", 100), False),
-    ("yfinance-PAXG-USD-5m", lambda: source_yfinance("PAXG-USD", "5m", "5d", 100), True),
-    ("yahoo-chart-PAXG-USD-15m", lambda: source_yahoo_chart_api("PAXG-USD", "15m", "1mo", 100), True),
+    ("kraken-PAXGUSD-5m", lambda: source_kraken_ohlc("PAXGUSD", 5, 100), False),
+    ("yfinance-PAXG-USD-5m", lambda: source_yfinance("PAXG-USD", "5m", "5d", 100), False),
+    ("yahoo-chart-PAXG-USD-5m", lambda: source_yahoo_chart_api("PAXG-USD", "5m", "5d", 100), False),
+    ("kraken-PAXGUSD-15m", lambda: source_kraken_ohlc("PAXGUSD", 15, 100), False),
+    ("yfinance-XAUT-USD-5m", lambda: source_yfinance("XAUT-USD", "5m", "5d", 100), True),
+    ("yfinance-PAXG-USD-15m", lambda: source_yfinance("PAXG-USD", "15m", "1mo", 100), True),
 )
 
 SWING_SOURCES: Tuple[Tuple[str, Callable[[], Optional[pd.DataFrame]], bool], ...] = (
-    ("yfinance-XAUUSD=X-1h", lambda: source_yfinance("XAUUSD=X", "1h", "3mo", 120), False),
-    ("yahoo-chart-XAUUSD=X-1h", lambda: source_yahoo_chart_api("XAUUSD=X", "1h", "3mo", 120), False),
-    ("yfinance-XAUUSD=X-15m-resamp", lambda: source_yfinance("XAUUSD=X", "15m", "1mo", 120), False),
-    ("yfinance-PAXG-USD-1h", lambda: source_yfinance("PAXG-USD", "1h", "3mo", 120), True),
-    ("yahoo-chart-PAXG-USD-1h", lambda: source_yahoo_chart_api("PAXG-USD", "1h", "3mo", 120), True),
+    ("kraken-PAXGUSD-1h", lambda: source_kraken_ohlc("PAXGUSD", 60, 120), False),
+    ("yfinance-PAXG-USD-1h", lambda: source_yfinance("PAXG-USD", "1h", "3mo", 120), False),
+    ("yahoo-chart-PAXG-USD-1h", lambda: source_yahoo_chart_api("PAXG-USD", "1h", "3mo", 120), False),
+    ("yfinance-XAUT-USD-1h", lambda: source_yfinance("XAUT-USD", "1h", "3mo", 120), True),
     ("stooq-XAUUSD-1d", lambda: source_stooq_spot("xauusd", "d", 100), True),
 )
 
@@ -847,15 +929,16 @@ def fetch_market_data(mode: str = "SWING") -> Tuple[pd.DataFrame, str, bool]:
             df = loader()
             if df is None or len(df) < 80:
                 raise RuntimeError("insufficient rows")
+            df, final_name, _ = _align_to_spot_basis(df, name)
             log.info(
                 "Feed OK [%s] -> %s | rows=%d | last=%s | latency=%.2fs",
                 mode,
-                name,
+                final_name,
                 len(df),
                 df.index[-1].isoformat(),
                 time.time() - started,
             )
-            return df, name, degraded
+            return df, final_name, degraded
         except Exception as exc:
             errors.append(f"{name}:{type(exc).__name__}")
             log.warning("Feed FAIL [%s] -> %s :: %s", mode, name, exc)
@@ -871,7 +954,6 @@ def validate_market_health(
     last_ts = df.index[-1].to_pydatetime()
     age_min = (utcnow() - last_ts).total_seconds() / 60.0
 
-    # 1. Stale timestamp & flatline guard
     is_daily_feed = (df.index.to_series().diff().dropna().median().total_seconds() >= 43200)
     stale_limit = 2880 if is_daily_feed else profile.max_stale_minutes
     if session_open and age_min > stale_limit:
@@ -879,7 +961,6 @@ def validate_market_health(
     if df["close"].tail(6).nunique() <= 1:
         reasons.append("FLATLINE_PRICE_FEED")
 
-    # 2. Anomaly spike guard using robust MAD sigma
     closes = df["close"].astype(float)
     log_ret = np.log(closes / closes.shift(1)).dropna()
     if len(log_ret) >= 20:
@@ -896,7 +977,6 @@ def validate_market_health(
     if last_pct_range > max(6.5 * med_pct_range, 0.035):
         reasons.append(f"CANDLE_RANGE_SPIKE ({last_pct_range:.4f})")
 
-    # 3. Volatility shock guard
     atr = atr_series(df, profile.atr_period)
     atr_now = safe_float(atr.iloc[-1], EPS)
     atr_base = max(safe_float(atr.tail(60).median(), atr_now), EPS)
@@ -1095,7 +1175,6 @@ def pillar_smc(df: pd.DataFrame, lookback: int = 3) -> PillarResult:
     lh = last_sh < prev_sh
     ll = last_sl < prev_sl
 
-    # Close-confirmed BOS / ChoCh or clean HH/HL pullback continuation
     if price > last_sh and prev_close <= last_sh:
         event = "BOS_BULL" if hl else "CHOCH_BULL"
         score = 96.0 + 4.0 * clamp((price - last_sh) / atr_v, 0.0, 1.0)
@@ -1326,7 +1405,7 @@ def pillar_regime_augment(
     rsi = safe_float(rsi_series(df["close"], profile.rsi_period).iloc[-1], 50.0)
 
     is_choppy = (er < profile.min_er) or (chop > profile.max_chop) or (adx < profile.min_adx)
-    atr_healthy = 0.12 <= atr_pct <= 0.94
+    atr_healthy = 0.10 <= atr_pct <= 0.985
 
     di_aligned = (candidate_dir == "BUY" and pdi > mdi) or (candidate_dir == "SELL" and mdi > pdi)
     if candidate_dir == "BUY":
@@ -1336,19 +1415,18 @@ def pillar_regime_augment(
     else:
         rsi_ok = False
 
+    sign = 1.0 if candidate_dir == "BUY" else (-1.0 if candidate_dir == "SELL" else 0.0)
     if is_choppy:
         regime_label = "CHOPPY"
         score = 0.0
     elif not atr_healthy:
         regime_label = "EXTREME_VOL"
-        score = 35.0
+        score = sign * 35.0
     elif di_aligned and rsi_ok:
         regime_label = "TREND_PRIME"
-        sign = 1.0 if candidate_dir == "BUY" else -1.0
         score = sign * 100.0
     else:
         regime_label = "WEAK_MOMENTUM"
-        sign = 1.0 if candidate_dir == "BUY" else -1.0
         score = sign * 55.0
 
     return PillarResult(
@@ -1423,7 +1501,7 @@ def analyze_mode(
     p_mtf = pillar_mtf(df, profile)
 
     prelim_vote = 0.45 * p_smc.score + 0.35 * p_mtf.score + 0.20 * p_of.score
-    candidate_dir = "BUY" if prelim_vote > 0 else ("SELL" if prelim_vote < 0 else "NEUTRAL")
+    candidate_dir = "BUY" if prelim_vote >= 25.0 else ("SELL" if prelim_vote <= -25.0 else "NEUTRAL")
 
     p_z = pillar_zscore(df, profile.z_window, candidate_dir)
     p_reg = pillar_regime_augment(df, profile, candidate_dir)
