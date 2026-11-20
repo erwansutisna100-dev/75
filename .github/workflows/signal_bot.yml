@@ -1,83 +1,98 @@
-name: APEX-QUANT-OMNI SOVEREIGN v75.2
+name: APEX-QUANT-OMNI XAUUSD Signal Engine
 
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    # Runs every 15 minutes Monday through Friday, plus Sunday market open window
+    - cron: '*/15 * * * 0-5'
   workflow_dispatch:
     inputs:
       mode:
-        description: "Execution mode (once = cycle + listener, check = analysis only)"
-        required: false
-        default: "once"
+        description: 'Execution mode (once, check, listen)'
+        required: true
+        default: 'once'
         type: choice
         options:
           - once
           - check
           - listen
+      strategy:
+        description: 'Strategy mode (all, scalp, swing)'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - scalp
+          - swing
       listen_seconds:
-        description: "Listener budget (seconds)"
+        description: 'Telegram command polling budget in seconds (0 to skip)'
         required: false
-        default: "240"
-
-concurrency:
-  group: apex-quant-omni
-  cancel-in-progress: false
+        default: '120'
+        type: string
 
 permissions:
   contents: read
 
-jobs:
-  apex-quant-omni:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+concurrency:
+  group: apex-quant-omni-xauusd
+  cancel-in-progress: false
 
-    env:
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-      ACCOUNT_BALANCE: "10000"
-      RISK_PERCENT: "1.0"
-      CONTRACT_SIZE: "100"
-      DB_PATH: "trading_signals.db"
-      CHART_PATH: "backtest_performance.png"
-      POLL_SECONDS: "240"
-      PYTHONUNBUFFERED: "1"
-      MPLBACKEND: "Agg"
-      PYTHONWARNINGS: "ignore"
+jobs:
+  run-signal-engine:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
-      - name: Checkout repository
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.11
+      - name: Set Up Python 3.11
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-          cache: "pip"
+          python-version: '3.11'
+          cache: 'pip'
 
-      - name: Install dependencies
+      - name: Install Dependencies
         run: |
-          python -m pip install --upgrade pip wheel setuptools
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Restore SQLite artifact
-        uses: actions/cache@v4
+      - name: Restore Persistent SQLite State
+        id: restore-db
+        uses: actions/cache/restore@v4
         with:
           path: trading_signals.db
-          key: apex-quant-db-${{ github.run_id }}
+          key: xauusd-state-${{ github.run_id }}
           restore-keys: |
-            apex-quant-db-
+            xauusd-state-
 
-      - name: Execute sovereign engine
+      - name: Run APEX-QUANT-OMNI Signal Engine
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          ACCOUNT_BALANCE: '10000'
+          RISK_PERCENT: '1.0'
+          CONTRACT_SIZE: '100'
+          PIP_SIZE: '0.1'
+          MIN_CONFLUENCE_SCALP: '95.0'
+          MIN_CONFLUENCE_SWING: '95.0'
+          DB_PATH: 'trading_signals.db'
+          CHART_PATH: 'backtest_performance.png'
         run: |
-          MODE="${{ github.event.inputs.mode }}"
-          if [ -z "$MODE" ]; then MODE="once"; fi
-          LISTEN="${{ github.event.inputs.listen_seconds }}"
-          if [ -z "$LISTEN" ]; then LISTEN="240"; fi
-          echo "Launching engine :: mode=$MODE listen=$LISTEN"
-          python bot.py --mode "$MODE" --listen-seconds "$LISTEN"
+          MODE="${{ github.event.inputs.mode || 'once' }}"
+          STRATEGY="${{ github.event.inputs.strategy || 'all' }}"
+          LISTEN_SEC="${{ github.event.inputs.listen_seconds || '120' }}"
+          python bot.py --mode "$MODE" --strategy "$STRATEGY" --listen-seconds "$LISTEN_SEC"
 
-      - name: Upload forensic artifacts
+      - name: Save Updated SQLite State
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: trading_signals.db
+          key: xauusd-state-${{ github.run_id }}
+
+      - name: Upload DB & Backtest Performance Artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -85,5 +100,5 @@ jobs:
           path: |
             trading_signals.db
             backtest_performance.png
-          if-no-files-found: warn
-          retention-days: 30
+          if-no-files-found: ignore
+          retention-days: 14
